@@ -1,0 +1,131 @@
+# =====================================================================
+# सादा Windows 11 टेस्ट (VirtualBox) - बस एक बार, ~6 घंटे
+# कोई Google Drive नहीं, कोई सेव नहीं, कोई अपने-आप दोबारा चलना नहीं
+#
+# फ़ाइल रखें: .github/workflows/windows11-simple.yml
+#
+# Secrets (Settings > Secrets and variables > Actions):
+#   WIN_ISO_URL  : Windows 11 ISO का सीधा डाउनलोड लिंक
+#   WIN_PASSWORD : Windows के अंदर user (winuser) का पासवर्ड
+#   RDP_PASSWORD : RDP के पहले login का पासवर्ड
+#   NGROK_TOKEN  : ngrok authtoken
+#
+# चलाने के बाद Summary में RDP address दिखेगा.
+# RDP app में: पहले user "runner" + RDP_PASSWORD,
+# फिर Windows में winuser + WIN_PASSWORD.
+# =====================================================================
+name: Windows 11 Simple
+
+on:
+  workflow_dispatch:
+
+jobs:
+  vm:
+    runs-on: ubuntu-latest
+    timeout-minutes: 358
+    env:
+      VM: win11
+      VMDIR: /home/runner/vm
+    steps:
+      - name: Disk साफ़ + hardware check
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          df -h /
+          nproc
+          free -m
+          echo "VT-x/AMD-V flags: $(grep -Ec '(vmx|svm)' /proc/cpuinfo)"
+          ls -l /dev/kvm || echo "no /dev/kvm"
+
+      - name: VirtualBox + ngrok install
+        run: |
+          echo "virtualbox-ext-pack virtualbox-ext-pack/license select true" | sudo debconf-set-selections
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            virtualbox virtualbox-ext-pack virtualbox-guest-additions-iso \
+            linux-headers-$(uname -r) jq
+          curl -fsSL https://ngrok-agent.s3.amazonaws.com/ngrok.asc | sudo tee /etc/apt/trusted.gpg.d/ngrok.asc >/dev/null
+          echo "deb https://ngrok-agent.s3.amazonaws.com buster main" | sudo tee /etc/apt/sources.list.d/ngrok.list
+          sudo apt-get update
+          sudo apt-get install -y ngrok
+          sudo modprobe -r kvm_intel kvm_amd kvm 2>/dev/null || true
+          sudo modprobe vboxdrv
+          sudo chmod 666 /dev/vboxdrv /dev/vboxdrvu 2>/dev/null || true
+          VBoxManage --version
+
+      - name: Windows 11 ISO डाउनलोड
+        env:
+          WIN_ISO_URL: ${{ secrets.WIN_ISO_URL }}
+        run: |
+          mkdir -p /tmp/iso
+          curl -fL --retry 3 -o /tmp/iso/win11.iso "$WIN_ISO_URL"
+          ls -lh /tmp/iso
+
+      - name: VM बनाओ + Windows install शुरू
+        env:
+          WIN_PASSWORD: ${{ secrets.WIN_PASSWORD }}
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$VMDIR"
+          VBoxManage setproperty machinefolder "$VMDIR"
+
+          CPUS=$(( $(nproc) > 2 ? $(nproc) - 1 : 2 ))
+          MEM=$(( $(free -m | awk '/^Mem:/{print $2}') - 3072 ))
+          [ "$MEM" -lt 4096 ] && MEM=4096
+          echo "VM को मिलेगा: $CPUS CPU, $MEM MB RAM"
+
+          VBoxManage createvm --name "$VM" --ostype Windows11_64 --register
+          VBoxManage modifyvm "$VM" --cpus "$CPUS" --memory "$MEM" \
+            --firmware efi --tpm-type 2.0 \
+            --graphicscontroller vboxsvga --vram 128 --nic1 nat \
+            --usbxhci on --mouse usbtablet \
+            --vrde on --vrdeport 3389 --vrdeauthtype external
+          # अगर RDP login न चले तो ऊपर की जगह --vrdeauthtype null आज़माएं
+
+          VBoxManage createmedium disk --filename "$VMDIR/$VM/$VM.vdi" --size 40960 --variant Standard
+          VBoxManage storagectl "$VM" --name SATA --add sata --controller IntelAhci
+          VBoxManage storageattach "$VM" --storagectl SATA --port 0 --device 0 --type hdd --medium "$VMDIR/$VM/$VM.vdi"
+          VBoxManage storageattach "$VM" --storagectl SATA --port 1 --device 0 --type dvddrive --medium emptydrive
+          VBoxManage storageattach "$VM" --storagectl SATA --port 2 --device 0 --type dvddrive --medium emptydrive
+
+          VBoxManage unattended install "$VM" --iso=/tmp/iso/win11.iso \
+            --user=winuser --password="$WIN_PASSWORD" --full-user-name="Win User" \
+            --install-additions --locale=en_US --time-zone=UTC --image-index=1
+
+          echo "runner:$RDP_PASSWORD" | sudo chpasswd
+          VBoxManage startvm "$VM" --type headless
+
+      - name: ngrok से RDP address
+        env:
+          NGROK_TOKEN: ${{ secrets.NGROK_TOKEN }}
+        run: |
+          set -euo pipefail
+          ngrok config add-authtoken "$NGROK_TOKEN"
+          nohup ngrok tcp 3389 --log=stdout > /tmp/ngrok.log 2>&1 &
+          ADDR=""
+          for i in $(seq 1 20); do
+            ADDR=$(curl -s localhost:4040/api/tunnels | jq -r '.tunnels[0].public_url // empty') || true
+            [ -n "$ADDR" ] && break
+            sleep 3
+          done
+          [ -n "$ADDR" ] || { cat /tmp/ngrok.log; exit 1; }
+          ADDR=${ADDR#tcp://}
+          echo "::notice title=RDP address::$ADDR (user: runner)"
+          {
+            echo "### Windows 11 RDP"
+            echo "Address: \`$ADDR\`"
+            echo "पहला login: runner + RDP_PASSWORD"
+            echo "फिर Windows: winuser + WIN_PASSWORD"
+            echo "(पहली बार Windows install होने में 30-40 मिनट लगेंगे, स्क्रीन पर दिखता रहेगा)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: VM चलने दो (~5h50m तक)
+        run: |
+          END=$(( $(date +%s) + 350 * 60 ))
+          while [ "$(date +%s)" -lt "$END" ]; do
+            if ! VBoxManage showvminfo "$VM" --machinereadable | grep -q '^VMState="running"'; then
+              echo "VM बंद हो गई"
+              break
+            fi
+            sleep 30
+          done
